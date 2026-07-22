@@ -10,6 +10,11 @@ import org.jaudiotagger.tag.FieldKey;
 import org.jaudiotagger.tag.Tag;
 import org.jaudiotagger.tag.images.Artwork;
 import org.jaudiotagger.tag.images.ArtworkFactory;
+import service.tag.NcmTagProvider;
+import service.tag.PathTagProvider;
+import service.tag.TagInfo;
+import service.tag.TagMode;
+import service.tag.TagProvider;
 import utils.AES;
 import utils.CR4;
 import utils.Utils;
@@ -36,14 +41,29 @@ public class Converter {
      * @return 转换成功与否
      */
     public boolean ncm2Mp3(String ncmFilePath, String outFilePath) {
+        return ncm2Mp3(ncmFilePath, outFilePath, TagMode.NCM);
+    }
+
+    /**
+     * NCM转换MP3
+     * 功能:将NCM音乐转换为MP3,并按指定的标签模式写入 标题/歌手/专辑/封面
+     *
+     * @param ncmFilePath NCM文件路径
+     * @param outFilePath MP3文件路径
+     * @param tagMode     标签信息来源模式
+     * @return 转换成功与否
+     */
+    public boolean ncm2Mp3(String ncmFilePath, String outFilePath, TagMode tagMode) {
         try {
             Ncm ncm = new Ncm();
             ncm.setNcmFile(ncmFilePath);
             FileInputStream inputStream = new FileInputStream(ncm.getNcmFile());
             magicHeader(inputStream);
             byte[] key = cr4Key(inputStream);
-            Mata mata = JSON.parseObject(mataData(inputStream), Mata.class);
+            String mataJson = mataData(inputStream);
+            Mata mata = JSON.parseObject(mataJson, Mata.class);
             ncm.setMata(mata);
+            String musicId = JSON.parseObject(mataJson).getString("musicId");
             byte[] image = albumImage(inputStream);
             ncm.setImage(image);
             File ncmFile = new File(ncmFilePath);
@@ -51,7 +71,7 @@ public class Converter {
             ncm.setOutFile(outFilePath);
             FileOutputStream outputStream = new FileOutputStream(ncm.getOutFile());
             musicData(inputStream, outputStream, key);
-            combineFile(ncm);
+            combineFile(ncm, tagProviderFor(tagMode).provide(ncmFile, mata, musicId, image));
             System.out.format("转换成功文件：%s\n", outFilePath);
             return true;
         } catch (Exception e) {
@@ -59,6 +79,13 @@ public class Converter {
             System.out.format("转换失败文件：%s\n", outFilePath);
             return false;
         }
+    }
+
+    /**
+     * 按标签模式选择标签信息来源策略
+     */
+    private TagProvider tagProviderFor(TagMode tagMode) {
+        return (tagMode == TagMode.PATH) ? new PathTagProvider() : new NcmTagProvider();
     }
 
     /**
@@ -167,15 +194,15 @@ public class Converter {
      * 功能:将NCM中各个信息整合到一起,转换成对应音乐格式
      *
      */
-    private void combineFile(Ncm ncm) throws Exception{
+    private void combineFile(Ncm ncm, TagInfo tagInfo) throws Exception{
         AudioFile audioFile = AudioFileIO.read(new File(ncm.getOutFile()));
         Tag tag = audioFile.getTag();
-        tag.setField(FieldKey.ALBUM, ncm.getMata().album);
-        tag.setField(FieldKey.TITLE, ncm.getMata().musicName);
-        tag.setField(FieldKey.ARTIST, ncm.getMata().artist[0]);
-        BufferedImage image = ImageIO.read(new ByteArrayInputStream(ncm.getImage()));
+        tag.setField(FieldKey.ALBUM, tagInfo.album);
+        tag.setField(FieldKey.TITLE, tagInfo.title);
+        tag.setField(FieldKey.ARTIST, tagInfo.artists);
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(tagInfo.cover));
         if (image != null) {
-            MetadataBlockDataPicture coverArt = new MetadataBlockDataPicture(ncm.getImage(), 0, Utils.albumImageMimeType(ncm.getImage()), "", image.getWidth(), image.getHeight(), image.getColorModel().hasAlpha() ? 32 : 24, 0);
+            MetadataBlockDataPicture coverArt = new MetadataBlockDataPicture(tagInfo.cover, 0, Utils.albumImageMimeType(tagInfo.cover), "", image.getWidth(), image.getHeight(), image.getColorModel().hasAlpha() ? 32 : 24, 0);
             Artwork artwork = ArtworkFactory.createArtworkFromMetadataBlockDataPicture(coverArt);
             tag.setField(tag.createField(artwork));
         }

@@ -21,6 +21,17 @@ If don't add command, there will open NCM2MP3 GUI directly
 -h,-help                      : Help about any command
 ```
 
+转换时可以通过`-m/--mode`选择标签信息来源(默认为`ncm`,图形界面底部也可以直接选择模式):
+
+```text
+-m,--mode <ncm|path>
+  ncm : 使用NCM文件内置的标题/歌手/专辑/封面信息(原有行为)
+  path: 歌手与专辑按 歌手/专辑/歌曲 目录结构获取,
+        封面取上级 meta 文件夹中的 track-{musicId} 图片(找不到时回退到NCM内置封面)
+
+示例: java -jar NCM2MP3.jar -c -m path /Users/johnny/Music/网易云音乐
+```
+
 
 ## 原理说明
   NCM格式是网易云音乐特有的音乐格式,这种音乐格式用到AES,RC4的加密算法对普通的音乐格式(如MP3,FLAC)进行加密,若要了解该加密过程,最好的方法就是知道起格式图,以及加密的原理(可以参考笔记`密码学.md`).

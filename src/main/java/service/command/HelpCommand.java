@@ -16,6 +16,10 @@ public class HelpCommand extends BaseCommand {
         System.out.println("[Command List]");
         System.out.println("-v,-view                      : open NCM View GUI(default command)");
         System.out.println("-c,--convert [path] ...       : convert NCM File in path to ./output directory");
+        System.out.println("-m,--mode <ncm|path>          : tag mode used with -c, default ncm");
+        System.out.println("                                ncm : use tags embedded in NCM file");
+        System.out.println("                                path: artist/album from <artist>/<album>/<song> dirs,");
+        System.out.println("                                      cover from meta/track-{musicId} image");
         System.out.println("-h,-help                      : Help about any command");
         System.exit(0);
     }

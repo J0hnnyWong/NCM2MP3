@@ -7,6 +7,7 @@ package view;
 import com.formdev.flatlaf.FlatIntelliJLaf;
 import executor.AsyncTaskExecutor;
 import executor.ConvertTask;
+import service.tag.TagMode;
 import utils.Utils;
 
 import javax.swing.*;
@@ -54,7 +55,8 @@ public class View extends JFrame {
             for (int i = 0; i < table.getModel().getRowCount(); i++) {
                 if (table.getModel().getValueAt(i, 3).equals("准备转换")) {
                     String ncmFilePath = (String) table.getModel().getValueAt(i, 1);
-                    tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, table.getModel(), i)));
+                    TagMode tagMode = (TagMode) modeComboBox.getSelectedItem();
+                    tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, tagMode, table.getModel(), i)));
                 }
             }
         }
@@ -103,7 +105,7 @@ public class View extends JFrame {
                         if ("bord\u0065r"
                                 .equals(e.getPropertyName())) throw new RuntimeException();
                     });
-            panel.setLayout(new GridLayout(1, 3, 2, 2));
+            panel.setLayout(new GridLayout(1, 4, 2, 2));
 
             //---- button1 ----
             button1.setText("\u9009\u62e9\u6587\u4ef6");
@@ -134,6 +136,11 @@ public class View extends JFrame {
                 }
             });
             panel.add(button3);
+
+            //---- modeComboBox ----
+            modeComboBox = new JComboBox<>(TagMode.values());
+            modeComboBox.setToolTipText("标签信息来源模式");
+            panel.add(modeComboBox);
         }
         contentPane.add(panel, BorderLayout.SOUTH);
 
@@ -211,4 +218,6 @@ public class View extends JFrame {
     //JFormChooser1,JFormChooser2
     private JFileChooser jFileChooser1;
     private JFileChooser jFileChooser2;
+    //标签信息来源模式选择
+    private JComboBox<TagMode> modeComboBox;
 }
