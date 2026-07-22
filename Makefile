@@ -1,5 +1,10 @@
 # Makefile for NCM2MP3 (Maven project)
 
+# 固定使用 JDK 17 构建：lombok 1.18.22 不兼容过高的 JDK 版本
+JAVA_HOME ?= /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+export JAVA_HOME
+export PATH := $(JAVA_HOME)/bin:$(PATH)
+
 JAR := target/NCM2MP3-3.1.0.jar
 
 .PHONY: all build run clean help
