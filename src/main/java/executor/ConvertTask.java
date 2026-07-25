@@ -1,5 +1,6 @@
 package executor;
 
+import service.ConvertOptions;
 import service.Converter;
 import service.tag.TagMode;
 
@@ -13,7 +14,7 @@ public class ConvertTask implements Callable<Boolean> {
 
     private final String ncmFilePath;
     private final String outFilePath;
-    private final TagMode tagMode;
+    private final ConvertOptions options;
     private final TableModel model;
     private final int rowIndex;
 
@@ -24,7 +25,7 @@ public class ConvertTask implements Callable<Boolean> {
      * @param outFilePath 输出路径
      */
     public ConvertTask(String ncmFilePath, String outFilePath, TableModel model, int rowIndex) {
-        this(ncmFilePath, outFilePath, TagMode.NCM, model, rowIndex);
+        this(ncmFilePath, outFilePath, ConvertOptions.defaults(), model, rowIndex);
     }
 
     /**
@@ -32,12 +33,12 @@ public class ConvertTask implements Callable<Boolean> {
      *
      * @param ncmFilePath ncm文件路径
      * @param outFilePath 输出路径
-     * @param tagMode     标签信息来源模式
+     * @param options     转换配置选项
      */
-    public ConvertTask(String ncmFilePath, String outFilePath, TagMode tagMode, TableModel model, int rowIndex) {
+    public ConvertTask(String ncmFilePath, String outFilePath, ConvertOptions options, TableModel model, int rowIndex) {
         this.ncmFilePath = ncmFilePath;
         this.outFilePath = outFilePath;
-        this.tagMode = tagMode;
+        this.options = options;
         this.model = model;
         this.rowIndex = rowIndex;
         model.setValueAt("转换中..", rowIndex, 3);
@@ -47,7 +48,7 @@ public class ConvertTask implements Callable<Boolean> {
      * 线程执行方法:NCM文件转换,并修改器转换状态
      */
     public Boolean call() {
-        if (new Converter().ncm2Mp3(ncmFilePath, outFilePath, tagMode)) {
+        if (new Converter().ncm2Mp3(ncmFilePath, outFilePath, options)) {
             model.setValueAt("转换完毕", rowIndex, 3);
             return true;
         } else {

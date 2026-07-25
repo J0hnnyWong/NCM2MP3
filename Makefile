@@ -7,9 +7,12 @@ export PATH := $(JAVA_HOME)/bin:$(PATH)
 
 JAR := target/NCM2MP3-3.1.0.jar
 
-.PHONY: all build run clean help
+.PHONY: all build run clean help setup
 
 all: build
+
+setup:
+	brew install openjdk@17 ffmpeg
 
 build:
 	mvn package

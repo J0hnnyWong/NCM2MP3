@@ -7,6 +7,7 @@ package view;
 import com.formdev.flatlaf.FlatIntelliJLaf;
 import executor.AsyncTaskExecutor;
 import executor.ConvertTask;
+import service.ConvertOptions;
 import service.tag.TagMode;
 import utils.Utils;
 
@@ -22,14 +23,31 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Future;
+import java.util.prefs.Preferences;
 
 /**
  * @author charlottexiao
  */
 public class View extends JFrame {
+    private static final Preferences PREFS = Preferences.userNodeForPackage(View.class);
+    private static final String PREF_TAG_MODE = "tagMode";
+    private static final String PREF_FFMPEG = "reEncodeWithFfmpeg";
+
     public View() {
         FlatIntelliJLaf.setup();
+        loadPreferences();
         initComponents();
+    }
+
+    private void loadPreferences() {
+        String savedTagMode = PREFS.get(PREF_TAG_MODE, TagMode.NCM.name());
+        currentOptions.tagMode = TagMode.from(savedTagMode);
+        currentOptions.reEncodeWithFfmpeg = PREFS.getBoolean(PREF_FFMPEG, false);
+    }
+
+    private void savePreferences() {
+        PREFS.put(PREF_TAG_MODE, currentOptions.tagMode.name());
+        PREFS.putBoolean(PREF_FFMPEG, currentOptions.reEncodeWithFfmpeg);
     }
 
     private void button1MouseClicked(MouseEvent e) {
@@ -55,8 +73,7 @@ public class View extends JFrame {
             for (int i = 0; i < table.getModel().getRowCount(); i++) {
                 if (table.getModel().getValueAt(i, 3).equals("准备转换")) {
                     String ncmFilePath = (String) table.getModel().getValueAt(i, 1);
-                    TagMode tagMode = (TagMode) modeComboBox.getSelectedItem();
-                    tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, tagMode, table.getModel(), i)));
+                    tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, currentOptions, table.getModel(), i)));
                 }
             }
         }
@@ -70,6 +87,76 @@ public class View extends JFrame {
         int rowCount = table.getModel().getRowCount();
         for (int i = 1; i <= rowCount; i++) {
             ((DefaultTableModel) table.getModel()).removeRow(rowCount - i);
+        }
+    }
+
+    private void button4MouseClicked(MouseEvent e) {
+        JDialog dialog = new JDialog(this, "高级配置", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+
+        JPanel settingsPanel = new JPanel();
+        settingsPanel.setLayout(new BoxLayout(settingsPanel, BoxLayout.Y_AXIS));
+        settingsPanel.setBorder(BorderFactory.createEmptyBorder(15, 20, 10, 20));
+
+        // --- 标签模式 ---
+        JPanel tagPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 5));
+        tagPanel.add(new JLabel("标签信息来源："));
+        JComboBox<TagMode> tagComboBox = new JComboBox<>(TagMode.values());
+        tagComboBox.setSelectedItem(currentOptions.tagMode);
+        tagPanel.add(tagComboBox);
+        settingsPanel.add(tagPanel);
+
+        settingsPanel.add(Box.createVerticalStrut(10));
+
+        // --- ffmpeg 重编码 ---
+        JPanel ffmpegPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 5));
+        JCheckBox ffmpegCheckbox = new JCheckBox("ffmpeg 重新编码为 MP3 (320kbps CBR)");
+        ffmpegCheckbox.setSelected(currentOptions.reEncodeWithFfmpeg);
+
+        // 检查 ffmpeg 是否可用
+        boolean ffmpegOk = isFfmpegInstalled();
+        if (!ffmpegOk) {
+            ffmpegCheckbox.setEnabled(false);
+            ffmpegCheckbox.setToolTipText("需要安装 ffmpeg：brew install ffmpeg");
+            ffmpegCheckbox.setText(ffmpegCheckbox.getText() + " [ffmpeg 未安装]");
+        }
+        ffmpegPanel.add(ffmpegCheckbox);
+        settingsPanel.add(ffmpegPanel);
+
+        dialog.add(settingsPanel, BorderLayout.CENTER);
+
+        // --- 按钮 ---
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 10));
+        JButton okButton = new JButton("确定");
+        JButton cancelButton = new JButton("取消");
+        buttonPanel.add(okButton);
+        buttonPanel.add(cancelButton);
+        dialog.add(buttonPanel, BorderLayout.SOUTH);
+
+        okButton.addActionListener(ev -> {
+            currentOptions.tagMode = (TagMode) tagComboBox.getSelectedItem();
+            if (ffmpegOk) {
+                currentOptions.reEncodeWithFfmpeg = ffmpegCheckbox.isSelected();
+            }
+            savePreferences();
+            dialog.dispose();
+        });
+        cancelButton.addActionListener(ev -> dialog.dispose());
+
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setResizable(false);
+        dialog.setVisible(true);
+    }
+
+    private boolean isFfmpegInstalled() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("ffmpeg", "-version");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            return p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -137,10 +224,15 @@ public class View extends JFrame {
             });
             panel.add(button3);
 
-            //---- modeComboBox ----
-            modeComboBox = new JComboBox<>(TagMode.values());
-            modeComboBox.setToolTipText("标签信息来源模式");
-            panel.add(modeComboBox);
+            //---- optionsButton ----
+            optionsButton = new JButton("高级配置");
+            optionsButton.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    button4MouseClicked(e);
+                }
+            });
+            panel.add(optionsButton);
         }
         contentPane.add(panel, BorderLayout.SOUTH);
 
@@ -218,6 +310,7 @@ public class View extends JFrame {
     //JFormChooser1,JFormChooser2
     private JFileChooser jFileChooser1;
     private JFileChooser jFileChooser2;
-    //标签信息来源模式选择
-    private JComboBox<TagMode> modeComboBox;
+    //高级配置
+    private JButton optionsButton;
+    private ConvertOptions currentOptions = ConvertOptions.defaults();
 }
