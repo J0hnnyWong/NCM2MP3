@@ -31,8 +31,6 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 
 /**
  * @author charlottexiao
@@ -97,21 +95,31 @@ public class Converter {
                     System.out.format("警告：ffmpeg 未安装或不可用，跳过重编码。请执行 brew install ffmpeg 安装。\n");
                 } else {
                     reEncodeWithFfmpeg(ncm.getOutFile());
+                    // ffmpeg 输出一定是 MP3，修正扩展名，否则 jaudiotagger 会按旧扩展名选错 reader
+                    String mp3Path = replaceExtension(ncm.getOutFile(), "mp3");
+                    if (!mp3Path.equals(ncm.getOutFile())) {
+                        File oldFile = new File(ncm.getOutFile());
+                        File newFile = new File(mp3Path);
+                        if (oldFile.renameTo(newFile)) {
+                            ncm.setOutFile(mp3Path);
+                        }
+                    }
                 }
             }
             combineFile(ncm, tagProviderFor(options.tagMode).provide(ncmFile, mata, musicId, image));
-            // 根据实际文件内容修正扩展名
-            String realExt = detectActualFormat(ncm.getOutFile());
-            File outFile = new File(ncm.getOutFile());
-            String currentName = outFile.getName();
-            int dotIdx = currentName.lastIndexOf('.');
-            if (dotIdx > 0) {
-                String currentExt = currentName.substring(dotIdx + 1);
-                if (!currentExt.equalsIgnoreCase(realExt)) {
-                    File renamed = new File(outFile.getParent(), currentName.substring(0, dotIdx) + "." + realExt);
-                    if (outFile.renameTo(renamed)) {
-                        ncm.setOutFile(renamed.getAbsolutePath());
-                        outFilePath = renamed.getAbsolutePath();
+            // 未开启 ffmpeg 时，根据实际内容修正扩展名
+            if (!options.reEncodeWithFfmpeg) {
+                String realExt = detectActualFormat(ncm.getOutFile());
+                File outFile = new File(ncm.getOutFile());
+                String currentName = outFile.getName();
+                int dotIdx = currentName.lastIndexOf('.');
+                if (dotIdx > 0) {
+                    String currentExt = currentName.substring(dotIdx + 1);
+                    if (!currentExt.equalsIgnoreCase(realExt)) {
+                        File renamed = new File(outFile.getParent(), currentName.substring(0, dotIdx) + "." + realExt);
+                        if (outFile.renameTo(renamed)) {
+                            ncm.setOutFile(renamed.getAbsolutePath());
+                        }
                     }
                 }
             }
@@ -254,15 +262,12 @@ public class Converter {
             tag.setField(FieldKey.ARTIST, tagInfo.artists);
             if (tagInfo.cover != null && tagInfo.cover.length > 0) {
                 try {
-                    BufferedImage image = ImageIO.read(new ByteArrayInputStream(tagInfo.cover));
-                    if (image != null) {
-                        MetadataBlockDataPicture coverArt = new MetadataBlockDataPicture(
-                                tagInfo.cover, 0, Utils.albumImageMimeType(tagInfo.cover),
-                                "", image.getWidth(), image.getHeight(),
-                                image.getColorModel().hasAlpha() ? 32 : 24, 0);
-                        Artwork artwork = ArtworkFactory.createArtworkFromMetadataBlockDataPicture(coverArt);
-                        tag.setField(tag.createField(artwork));
-                    }
+                    Artwork artwork = ArtworkFactory.getNew();
+                    artwork.setBinaryData(tagInfo.cover);
+                    artwork.setMimeType(Utils.albumImageMimeType(tagInfo.cover));
+                    artwork.setPictureType(3);  // 3 = front cover, iPod 只认这个
+                    artwork.setDescription("");
+                    tag.setField(artwork);
                 } catch (Exception e) {
                     System.out.format("跳过封面写入：%s (%s)\n", ncm.getOutFile(), e.getMessage());
                 }
@@ -280,6 +285,14 @@ public class Converter {
     /**
      * 探测输出文件的实际音频格式，返回标准扩展名
      */
+    private static String replaceExtension(String path, String newExt) {
+        int dotIdx = path.lastIndexOf('.');
+        if (dotIdx > 0) {
+            return path.substring(0, dotIdx) + "." + newExt;
+        }
+        return path + "." + newExt;
+    }
+
     private String detectActualFormat(String filePath) {
         try {
             byte[] header = new byte[16];
@@ -299,13 +312,28 @@ public class Converter {
             if (header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F') return "wav";
             // MP4/AAC magic (ftyp box, offsets vary)
             if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') return "m4a";
-            // fallback to ffprobe
-            byte[] rawData = Files.readAllBytes(Paths.get(filePath));
-            String probed = probeAudioFormat(rawData);
-            if (probed.contains("flac")) return "flac";
-            if (probed.contains("mp3")) return "mp3";
-            if (probed.contains("aac")) return "m4a";
-            if (probed.contains("vorbis")) return "ogg";
+            // fallback: 尝试用 ffprobe 探测
+            try {
+                ProcessBuilder pb = new ProcessBuilder(
+                        "ffprobe", "-v", "quiet",
+                        "-show_entries", "stream=codec_name",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        filePath
+                );
+                pb.redirectErrorStream(true);
+                Process p = pb.start();
+                StringBuilder out = new StringBuilder();
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                    String l;
+                    while ((l = r.readLine()) != null) out.append(l).append(" ");
+                }
+                p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+                String probed = out.toString();
+                if (probed.contains("flac")) return "flac";
+                if (probed.contains("mp3")) return "mp3";
+                if (probed.contains("aac")) return "m4a";
+                if (probed.contains("vorbis")) return "ogg";
+            } catch (Exception ignored) {}
         } catch (Exception e) {
             // ignore
         }
@@ -331,17 +359,17 @@ public class Converter {
      */
     private void reEncodeWithFfmpeg(String filePath) {
         File original = new File(filePath);
+        byte[] rawData;
+        try {
+            rawData = java.nio.file.Files.readAllBytes(original.toPath());
+        } catch (Exception e) {
+            System.out.format("ffmpeg 重编码失败（无法读取文件），保留原始文件：%s\n", filePath);
+            return;
+        }
+
         File temp = new File(filePath + ".ffmpeg.mp3");
         Process p = null;
         try {
-            // 先读取原始文件全部字节
-            byte[] rawData = java.nio.file.Files.readAllBytes(original.toPath());
-
-            // 先通过管道方式用 ffprobe 探测实际编码格式
-            String probedFormat = probeAudioFormat(rawData);
-            System.out.format("[ffmpeg] 探测到音频格式: %s (文件: %s)\n", probedFormat, filePath);
-
-            // 用管道方式重编码：数据从 stdin 传入，ffmpeg 无视扩展名自行探测
             ProcessBuilder pb = new ProcessBuilder(
                     "ffmpeg", "-y",
                     "-i", "pipe:0",
@@ -352,77 +380,55 @@ public class Converter {
             );
             pb.redirectErrorStream(true);
             p = pb.start();
-
-            // 写入原始数据到 ffmpeg stdin
             p.getOutputStream().write(rawData);
             p.getOutputStream().close();
-
-            // 读取 ffmpeg 输出用于调试
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.toLowerCase().contains("error")) {
-                        System.out.format("[ffmpeg] %s\n", line);
-                    }
-                }
+            // 静默读取避免阻塞，不打印错误
+            try (java.io.InputStream is = p.getInputStream()) {
+                is.transferTo(java.io.OutputStream.nullOutputStream());
             }
-
             int exitCode = p.waitFor();
-            if (exitCode != 0) {
+            if (exitCode == 0 && isValidAudio(temp)) {
+                if (original.delete()) {
+                    temp.renameTo(original);
+                } else {
+                    temp.delete();
+                }
+                System.out.format("ffmpeg 重编码完成：%s\n", filePath);
+            } else {
                 temp.delete();
-                System.out.format("ffmpeg 重编码失败（退出码: %d），保留原始文件：%s\n", exitCode, filePath);
-                return;
+                System.out.format("ffmpeg 重编码失败（无法解析该文件），保留原始文件：%s\n", filePath);
             }
-
-            if (!original.delete()) {
-                temp.delete();
-                System.out.format("ffmpeg 重编码失败（无法删除原始文件），保留原始文件：%s\n", filePath);
-                return;
-            }
-            if (!temp.renameTo(original)) {
-                System.out.format("ffmpeg 重编码失败（无法重命名临时文件），保留原始文件：%s\n", filePath);
-                return;
-            }
-            System.out.format("ffmpeg 重编码完成：%s\n", filePath);
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
             temp.delete();
-            System.out.format("ffmpeg 重编码异常（%s），保留原始文件：%s\n", e.getMessage(), filePath);
+            System.out.format("ffmpeg 重编码失败，保留原始文件：%s\n", filePath);
         }
     }
 
-    /**
-     * 用 ffprobe 探测音频的实际编码格式（写入无扩展名临时文件以正确探测）
-     */
-    private String probeAudioFormat(byte[] rawData) {
-        File probeFile = null;
+    /** 验证音频文件是否合法（有有效时长） */
+    private boolean isValidAudio(File file) {
+        if (!file.exists() || file.length() < 1024) return false;
         try {
-            probeFile = File.createTempFile("ncm_probe_", null);
-            java.nio.file.Files.write(probeFile.toPath(), rawData);
-
             ProcessBuilder pb = new ProcessBuilder(
                     "ffprobe", "-v", "quiet",
-                    "-i", probeFile.getAbsolutePath(),
-                    "-show_entries", "stream=codec_name",
-                    "-of", "default=noprint_wrappers=1:nokey=1"
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file.getAbsolutePath()
             );
             pb.redirectErrorStream(true);
             Process p = pb.start();
-
-            StringBuilder output = new StringBuilder();
+            String line;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append(" ");
-                }
+                line = reader.readLine();
             }
             p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
-            String result = output.toString().trim();
-            return result.isEmpty() ? "unknown" : result;
+            if (line != null && !line.equals("N/A") && !line.isEmpty()) {
+                return Double.parseDouble(line) > 0.5;
+            }
         } catch (Exception e) {
-            return "unknown";
-        } finally {
-            if (probeFile != null) probeFile.delete();
+            // ignore
         }
+        return false;
     }
+
 }
