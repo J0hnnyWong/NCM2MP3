@@ -23,16 +23,14 @@ public class PathTagProvider implements TagProvider {
         File albumDir = ncmFile.getParentFile();
         File artistDir = (albumDir != null) ? albumDir.getParentFile() : null;
         info.album = (albumDir != null) ? albumDir.getName() : mata.album;
-        info.artists = new String[]{(artistDir != null) ? artistDir.getName() : firstArtist(mata)};
+        info.artists = (artistDir != null)
+                ? ArtistNames.fromPathSegment(artistDir.getName())
+                : ArtistNames.of(mata.artist);
+        if (info.artists.length > 0) {
+            info.albumArtist = info.artists[0];
+        }
         info.cover = loadCover(albumDir, musicId, ncmCover);
         return info;
-    }
-
-    private String firstArtist(Mata mata) {
-        if (mata.artist != null && mata.artist.length > 0 && mata.artist[0].length > 0) {
-            return mata.artist[0][0];
-        }
-        return "";
     }
 
     private byte[] loadCover(File startDir, String musicId, byte[] ncmCover) {

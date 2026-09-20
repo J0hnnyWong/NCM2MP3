@@ -1,6 +1,8 @@
 package utils;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.concurrent.Future;
@@ -26,6 +28,60 @@ public class Utils {
         len |= (bytes[2] & 0xff) << 16;
         len |= (bytes[3] & 0xff) << 24;
         return len;
+    }
+
+    /**
+     * 读满指定长度
+     * 功能:循环读取直到取满len字节,避免InputStream单次read返回不足造成的偏移错位
+     *
+     * @param inputStream 输入流
+     * @param len         需要读取的字节数
+     * @return 长度为len的字节数组
+     */
+    public static byte[] readBlock(InputStream inputStream, int len) throws IOException {
+        byte[] bytes = new byte[len];
+        int off = 0;
+        while (off < len) {
+            int read = inputStream.read(bytes, off, len - off);
+            if (read < 0) {
+                break;
+            }
+            off += read;
+        }
+        return bytes;
+    }
+
+    /**
+     * 读取长度字段
+     * 功能:读取4字节小端无符号整型长度
+     *
+     * @param inputStream 输入流
+     * @return 长度
+     */
+    public static int readLength(InputStream inputStream) throws IOException {
+        return getLength(readBlock(inputStream, 4));
+    }
+
+    /**
+     * 跳过指定字节数
+     * 功能:循环跳过,避免skip()实际跳过数量不足
+     *
+     * @param inputStream 输入流
+     * @param len         需要跳过的字节数
+     */
+    public static void skipBlock(InputStream inputStream, long len) throws IOException {
+        long remain = len;
+        while (remain > 0) {
+            long skipped = inputStream.skip(remain);
+            if (skipped <= 0) {
+                if (inputStream.read() < 0) {
+                    break;
+                }
+                remain--;
+                continue;
+            }
+            remain -= skipped;
+        }
     }
 
     /**

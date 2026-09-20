@@ -15,8 +15,11 @@ public class NcmTagProvider implements TagProvider {
     public TagInfo provide(File ncmFile, Mata mata, String musicId, byte[] ncmCover) {
         TagInfo info = new TagInfo();
         info.title = mata.musicName;
-        info.artists = (mata.artist != null && mata.artist.length > 0) ? mata.artist[0] : new String[0];
+        info.artists = ArtistNames.of(mata.artist);
         info.album = mata.album;
+        if (info.artists.length > 0) {
+            info.albumArtist = info.artists[0];
+        }
         info.cover = ncmCover;
         return info;
     }

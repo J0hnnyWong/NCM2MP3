@@ -117,7 +117,7 @@ public class View extends JFrame {
         boolean ffmpegOk = isFfmpegInstalled();
         if (!ffmpegOk) {
             ffmpegCheckbox.setEnabled(false);
-            ffmpegCheckbox.setToolTipText("需要安装 ffmpeg：brew install ffmpeg");
+            ffmpegCheckbox.setToolTipText("需要先把 ffmpeg 加入 PATH(Windows: winget install Gyan.FFmpeg；macOS: brew install ffmpeg)");
             ffmpegCheckbox.setText(ffmpegCheckbox.getText() + " [ffmpeg 未安装]");
         }
         ffmpegPanel.add(ffmpegCheckbox);

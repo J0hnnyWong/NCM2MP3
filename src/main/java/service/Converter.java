@@ -10,6 +10,8 @@ import org.jaudiotagger.tag.FieldKey;
 import org.jaudiotagger.tag.Tag;
 import org.jaudiotagger.tag.images.Artwork;
 import org.jaudiotagger.tag.images.ArtworkFactory;
+import service.tag.AudioTagExtractor;
+import service.tag.LrcReader;
 import service.tag.NcmTagProvider;
 import service.tag.PathTagProvider;
 import service.tag.TagInfo;
@@ -28,6 +30,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
@@ -80,7 +83,7 @@ public class Converter {
             String mataJson = mataData(inputStream);
             Mata mata = JSON.parseObject(mataJson, Mata.class);
             ncm.setMata(mata);
-            String musicId = JSON.parseObject(mataJson).getString("musicId");
+            String musicId = mata.musicId;
             byte[] image = albumImage(inputStream);
             ncm.setImage(image);
             File ncmFile = new File(ncmFilePath);
@@ -90,9 +93,11 @@ public class Converter {
             ncm.setOutFile(outFilePath);
             FileOutputStream outputStream = new FileOutputStream(ncm.getOutFile());
             musicData(inputStream, outputStream, key);
+            // 解密出的原始音频自带完整标签,转换前先全部取出,转换完成后再写回目标文件
+            TagInfo sourceTag = collectSourceTag(ncmFile, mata, musicId, image, options.tagMode, new File(ncm.getOutFile()));
             if (options.reEncodeWithFfmpeg) {
                 if (!isFfmpegAvailable()) {
-                    System.out.format("警告：ffmpeg 未安装或不可用，跳过重编码。请执行 brew install ffmpeg 安装。\n");
+                    System.out.format("警告：ffmpeg 未安装或不可用，跳过重编码。\n");
                 } else {
                     reEncodeWithFfmpeg(ncm.getOutFile());
                     // ffmpeg 输出一定是 MP3，修正扩展名，否则 jaudiotagger 会按旧扩展名选错 reader
@@ -106,7 +111,7 @@ public class Converter {
                     }
                 }
             }
-            combineFile(ncm, tagProviderFor(options.tagMode).provide(ncmFile, mata, musicId, image));
+            combineFile(ncm, sourceTag);
             // 未开启 ffmpeg 时，根据实际内容修正扩展名
             if (!options.reEncodeWithFfmpeg) {
                 String realExt = detectActualFormat(ncm.getOutFile());
@@ -140,14 +145,33 @@ public class Converter {
     }
 
     /**
+     * 汇总一首歌的全部源信息:模式来源(NCM内置元数据/目录结构)为准,
+     * 解密音频内的标签与同目录 .lrc 歌词补齐缺失字段
+     *
+     * @param ncmFile     NCM文件
+     * @param mata        NCM内置元数据
+     * @param musicId     音乐ID
+     * @param ncmCover    NCM内置封面
+     * @param tagMode     标签模式
+     * @param decodedFile 解密出的原始音频
+     * @return 待写回的标签信息
+     */
+    private TagInfo collectSourceTag(File ncmFile, Mata mata, String musicId, byte[] ncmCover,
+                                     TagMode tagMode, File decodedFile) {
+        TagInfo info = tagProviderFor(tagMode).provide(ncmFile, mata, musicId, ncmCover);
+        info.fillBlanksFrom(LrcReader.read(ncmFile));
+        info.fillBlanksFrom(AudioTagExtractor.extract(decodedFile));
+        return info;
+    }
+
+    /**
      * NCM格式头部读取
      * 功能:MagicHeader读取
      *
      * @param inputStream ncm文件输入流
      */
     private void magicHeader(FileInputStream inputStream) throws Exception {
-        byte[] bytes = new byte[10];
-        inputStream.read(bytes, 0, 10);
+        Utils.readBlock(inputStream, 10);
     }
 
     /**
@@ -158,13 +182,9 @@ public class Converter {
      * @return CR4密钥
      */
     private byte[] cr4Key(FileInputStream inputStream) throws Exception {
-        byte[] bytes = new byte[4];
-        inputStream.read(bytes, 0, 4);
-        int len = Utils.getLength(bytes);
-        bytes = new byte[len];
-        inputStream.read(bytes, 0, len);
+        byte[] bytes = Utils.readBlock(inputStream, Utils.readLength(inputStream));
         //1.按字节对0x64异或
-        for (int i = 0; i < len; i++) {
+        for (int i = 0; i < bytes.length; i++) {
             bytes[i] ^= 0x64;
         }
         //2.AES解密(其中PKCS5Padding填充模式会去除末尾填充部分)
@@ -183,13 +203,10 @@ public class Converter {
      * @return JSON格式头部信息
      */
     private String mataData(FileInputStream inputStream) throws Exception {
-        byte[] bytes = new byte[4];
-        inputStream.read(bytes, 0, 4);
-        int len = Utils.getLength(bytes);
-        bytes = new byte[len];
-        inputStream.read(bytes, 0, len);
+        int len = Utils.readLength(inputStream);
+        byte[] bytes = Utils.readBlock(inputStream, len);
         //跳过:CRC(4字节),unused Gap(5字节)
-        inputStream.skip(9);
+        Utils.skipBlock(inputStream, 9);
         //1.按字节对0x63异或
         for (int i = 0; i < len; i++) {
             bytes[i] ^= 0x63;
@@ -213,12 +230,7 @@ public class Converter {
      * @return 专辑图片数据
      */
     private byte[] albumImage(FileInputStream inputStream) throws Exception {
-        byte[] bytes = new byte[4];
-        inputStream.read(bytes, 0, 4);
-        int len = Utils.getLength(bytes);
-        byte[] imageData = new byte[len];
-        inputStream.read(imageData, 0, len);
-        return imageData;
+        return Utils.readBlock(inputStream, Utils.readLength(inputStream));
     }
 
     /**
@@ -242,7 +254,7 @@ public class Converter {
     }
 
     /**
-     * 功能:将NCM中各个信息整合到一起,转换成对应音乐格式
+     * 功能:将源信息(标题/艺人/专辑/年份/流派/音轨/作曲/作词/歌词/封面)写回转换后的音频文件
      *
      */
     private void combineFile(Ncm ncm, TagInfo tagInfo) throws Exception{
@@ -257,9 +269,18 @@ public class Converter {
         Tag tag = audioFile.getTagOrCreateDefault();
         if (tag != null) {
             audioFile.setTag(tag);
-            tag.setField(FieldKey.ALBUM, tagInfo.album);
-            tag.setField(FieldKey.TITLE, tagInfo.title);
-            tag.setField(FieldKey.ARTIST, tagInfo.artists);
+            putField(ncm, tag, FieldKey.TITLE, tagInfo.title);
+            putField(ncm, tag, FieldKey.ARTIST, tagInfo.joinedArtists());
+            putField(ncm, tag, FieldKey.ALBUM, tagInfo.album);
+            putField(ncm, tag, FieldKey.ALBUM_ARTIST, tagInfo.albumArtist);
+            putField(ncm, tag, FieldKey.YEAR, leadingDigits(tagInfo.year));
+            putField(ncm, tag, FieldKey.GENRE, tagInfo.genre);
+            putField(ncm, tag, FieldKey.TRACK, leadingDigits(tagInfo.track));
+            putField(ncm, tag, FieldKey.DISC_NO, leadingDigits(tagInfo.disc));
+            putField(ncm, tag, FieldKey.COMPOSER, tagInfo.composer);
+            putField(ncm, tag, FieldKey.LYRICIST, tagInfo.lyricist);
+            putField(ncm, tag, FieldKey.COMMENT, tagInfo.comment);
+            putField(ncm, tag, FieldKey.LYRICS, tagInfo.lyrics);
             if (tagInfo.cover != null && tagInfo.cover.length > 0) {
                 try {
                     Artwork artwork = ArtworkFactory.getNew();
@@ -280,6 +301,34 @@ public class Converter {
         } else {
             System.out.format("跳过标签写入（无法创建 Tag）：%s\n", ncm.getOutFile());
         }
+    }
+
+    /**
+     * 写入单个标签字段:空值跳过,格式不支持时只跳过该字段而不影响其他字段
+     */
+    private void putField(Ncm ncm, Tag tag, FieldKey key, String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return;
+        }
+        try {
+            tag.setField(key, value);
+        } catch (Exception e) {
+            System.out.format("字段写入跳过 %s：%s (%s)\n", key, ncm.getOutFile(), e.getMessage());
+        }
+    }
+
+    /**
+     * 只保留开头的数字,用于 年份/音轨号/碟片号 这类要求纯数字的字段(如 "1/12" -> "1")
+     */
+    private static String leadingDigits(String value) {
+        if (value == null) {
+            return null;
+        }
+        int end = 0;
+        while (end < value.length() && Character.isDigit(value.charAt(end))) {
+            end++;
+        }
+        return end == 0 ? null : value.substring(0, end);
     }
 
     /**
@@ -359,14 +408,6 @@ public class Converter {
      */
     private void reEncodeWithFfmpeg(String filePath) {
         File original = new File(filePath);
-        byte[] rawData;
-        try {
-            rawData = java.nio.file.Files.readAllBytes(original.toPath());
-        } catch (Exception e) {
-            System.out.format("ffmpeg 重编码失败（无法读取文件），保留原始文件：%s\n", filePath);
-            return;
-        }
-
         File temp = new File(filePath + ".ffmpeg.mp3");
         Process p = null;
         try {
@@ -380,8 +421,14 @@ public class Converter {
             );
             pb.redirectErrorStream(true);
             p = pb.start();
-            p.getOutputStream().write(rawData);
-            p.getOutputStream().close();
+            // 分块写入标准输入:整首音频进堆会在并发转换时耗尽内存
+            try (FileInputStream fis = new FileInputStream(original);
+                 OutputStream os = p.getOutputStream()) {
+                byte[] buffer = new byte[0x8000];
+                for (int len; (len = fis.read(buffer)) > 0; ) {
+                    os.write(buffer, 0, len);
+                }
+            }
             // 静默读取避免阻塞，不打印错误
             try (java.io.InputStream is = p.getInputStream()) {
                 is.transferTo(java.io.OutputStream.nullOutputStream());
