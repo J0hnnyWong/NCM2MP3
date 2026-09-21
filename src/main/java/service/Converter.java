@@ -23,15 +23,16 @@ import utils.Utils;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
-import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
 
@@ -39,6 +40,10 @@ import java.util.concurrent.TimeUnit;
  * @author charlottexiao
  */
 public class Converter {
+
+    /** 单次 ffmpeg 编码的等待上限,超时视为失败,避免一个卡住的子进程永久占住工作线程 */
+    private static final long FFMPEG_TIMEOUT_MINUTES = 10;
+
     /**
      * NCM转换MP3
      * 功能:将NCM音乐转换为MP3
@@ -66,75 +71,73 @@ public class Converter {
 
     /**
      * NCM转换MP3
-     * 功能:将NCM音乐转换为MP3,支持高级配置选项
+     * 功能:NCM 解密 → 读取源信息 → (可选)ffmpeg 重编码 → 回写源信息
+     *
+     * 解密结果先进系统临时目录,只有最终产物才落到输出目录,
+     * 因此不会出现"输出目录里混着中间 FLAC"的情况,失败时也不会留下半成品
      *
      * @param ncmFilePath NCM文件路径
-     * @param outFilePath MP3文件路径
+     * @param outFilePath 输出目录
      * @param options     转换配置选项
      * @return 转换成功与否
      */
     public boolean ncm2Mp3(String ncmFilePath, String outFilePath, ConvertOptions options) {
+        File work = null;
         try {
             Ncm ncm = new Ncm();
             ncm.setNcmFile(ncmFilePath);
-            FileInputStream inputStream = new FileInputStream(ncm.getNcmFile());
-            magicHeader(inputStream);
-            byte[] key = cr4Key(inputStream);
-            String mataJson = mataData(inputStream);
-            Mata mata = JSON.parseObject(mataJson, Mata.class);
-            ncm.setMata(mata);
-            String musicId = mata.musicId;
-            byte[] image = albumImage(inputStream);
-            ncm.setImage(image);
             File ncmFile = new File(ncmFilePath);
-            String baseName = ncmFile.getName().substring(0, ncmFile.getName().length() - 3);
-            // 先用 NCM 元数据的格式作为临时扩展名，后续根据实际内容修正
-            outFilePath += File.separator + baseName + ncm.getMata().format;
-            ncm.setOutFile(outFilePath);
-            FileOutputStream outputStream = new FileOutputStream(ncm.getOutFile());
-            musicData(inputStream, outputStream, key);
+            Mata mata;
+            String musicId;
+            byte[] image;
+            try (FileInputStream inputStream = new FileInputStream(ncmFile)) {
+                magicHeader(inputStream);
+                byte[] key = cr4Key(inputStream);
+                mata = JSON.parseObject(mataData(inputStream), Mata.class);
+                musicId = mata.musicId;
+                image = albumImage(inputStream);
+                work = File.createTempFile("ncm2mp3-", "." + mata.format);
+                try (FileOutputStream outputStream = new FileOutputStream(work)) {
+                    musicData(inputStream, outputStream, key);
+                }
+            }
+            ncm.setMata(mata);
+            ncm.setImage(image);
             // 解密出的原始音频自带完整标签,转换前先全部取出,转换完成后再写回目标文件
-            TagInfo sourceTag = collectSourceTag(ncmFile, mata, musicId, image, options.tagMode, new File(ncm.getOutFile()));
+            TagInfo sourceTag = collectSourceTag(ncmFile, mata, musicId, image, options.tagMode, work);
+            String fileName = fileNameWithoutExtension(ncmFile.getName());
+            File target;
             if (options.reEncodeWithFfmpeg) {
                 if (!isFfmpegAvailable()) {
-                    System.out.format("警告：ffmpeg 未安装或不可用，跳过重编码。\n");
-                } else {
-                    reEncodeWithFfmpeg(ncm.getOutFile());
-                    // ffmpeg 输出一定是 MP3，修正扩展名，否则 jaudiotagger 会按旧扩展名选错 reader
-                    String mp3Path = replaceExtension(ncm.getOutFile(), "mp3");
-                    if (!mp3Path.equals(ncm.getOutFile())) {
-                        File oldFile = new File(ncm.getOutFile());
-                        File newFile = new File(mp3Path);
-                        if (oldFile.renameTo(newFile)) {
-                            ncm.setOutFile(mp3Path);
-                        }
-                    }
+                    throw new IOException("ffmpeg 不可用,无法重编码(Windows: winget install Gyan.FFmpeg / macOS: brew install ffmpeg)");
                 }
+                target = new File(outFilePath, fileName + ".mp3");
+                reEncodeWithFfmpeg(work, target);
+                if (options.keepFlacWithMp3) {
+                    copyFile(work, new File(outFilePath, fileName + "." + detectActualFormat(work)));
+                }
+            } else {
+                // 未重编码时保留原始音质,扩展名按解密出的真实格式来,不能只信 NCM 里写的 format
+                target = new File(outFilePath, fileName + "." + detectActualFormat(work));
+                moveFile(work, target);
+                work = null;
             }
+            ncm.setOutFile(target.getAbsolutePath());
             combineFile(ncm, sourceTag);
-            // 未开启 ffmpeg 时，根据实际内容修正扩展名
-            if (!options.reEncodeWithFfmpeg) {
-                String realExt = detectActualFormat(ncm.getOutFile());
-                File outFile = new File(ncm.getOutFile());
-                String currentName = outFile.getName();
-                int dotIdx = currentName.lastIndexOf('.');
-                if (dotIdx > 0) {
-                    String currentExt = currentName.substring(dotIdx + 1);
-                    if (!currentExt.equalsIgnoreCase(realExt)) {
-                        File renamed = new File(outFile.getParent(), currentName.substring(0, dotIdx) + "." + realExt);
-                        if (outFile.renameTo(renamed)) {
-                            ncm.setOutFile(renamed.getAbsolutePath());
-                        }
-                    }
-                }
-            }
             System.out.format("转换成功文件：%s\n", ncm.getOutFile());
             return true;
         } catch (Exception e) {
             e.printStackTrace();
-            System.out.format("转换失败文件：%s\n", outFilePath);
+            System.out.format("转换失败文件：%s\n", ncmFilePath);
             return false;
+        } finally {
+            deleteQuietly(work);
         }
+    }
+
+    private static String fileNameWithoutExtension(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
     }
 
     /**
@@ -235,7 +238,7 @@ public class Converter {
 
     /**
      * 音乐数据
-     * 功能:获取音乐数据
+     * 功能:RC4 解密音频数据写入输出流,流由调用方负责关闭
      *
      * @param inputStream  ncm文件输入流
      * @param outputStream 存音乐数据的文件输出流
@@ -249,8 +252,6 @@ public class Converter {
             cr4.PRGA(buffer, len);
             outputStream.write(buffer, 0, len);
         }
-        inputStream.close();
-        outputStream.close();
     }
 
     /**
@@ -332,60 +333,24 @@ public class Converter {
     }
 
     /**
-     * 探测输出文件的实际音频格式，返回标准扩展名
+     * 按文件头判断解密出的真实音频格式,返回扩展名(不带点)
      */
-    private static String replaceExtension(String path, String newExt) {
-        int dotIdx = path.lastIndexOf('.');
-        if (dotIdx > 0) {
-            return path.substring(0, dotIdx) + "." + newExt;
-        }
-        return path + "." + newExt;
-    }
-
-    private String detectActualFormat(String filePath) {
+    private static String detectActualFormat(File file) {
         try {
             byte[] header = new byte[16];
-            try (FileInputStream fis = new FileInputStream(filePath)) {
-                int read = fis.read(header);
-                if (read < 4) return "mp3";
-            }
-            // ID3 标签开头 → MP3
-            if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') return "mp3";
-            // MPEG sync word (0xFF 0xFB / 0xFF 0xF3 / 0xFF 0xFA / 0xFF 0xF2)
-            if ((header[0] & 0xFF) == 0xFF && ((header[1] & 0xE0) == 0xE0)) return "mp3";
-            // FLAC magic "fLaC"
-            if (header[0] == 'f' && header[1] == 'L' && header[2] == 'a' && header[3] == 'C') return "flac";
-            // OGG magic "OggS"
-            if (header[0] == 'O' && header[1] == 'g' && header[2] == 'g' && header[3] == 'S') return "ogg";
-            // WAV magic "RIFF"
-            if (header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F') return "wav";
-            // MP4/AAC magic (ftyp box, offsets vary)
-            if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') return "m4a";
-            // fallback: 尝试用 ffprobe 探测
-            try {
-                ProcessBuilder pb = new ProcessBuilder(
-                        "ffprobe", "-v", "quiet",
-                        "-show_entries", "stream=codec_name",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        filePath
-                );
-                pb.redirectErrorStream(true);
-                Process p = pb.start();
-                StringBuilder out = new StringBuilder();
-                try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                    String l;
-                    while ((l = r.readLine()) != null) out.append(l).append(" ");
+            try (FileInputStream fis = new FileInputStream(file)) {
+                if (fis.read(header) < 8) {
+                    return "mp3";
                 }
-                p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
-                String probed = out.toString();
-                if (probed.contains("flac")) return "flac";
-                if (probed.contains("mp3")) return "mp3";
-                if (probed.contains("aac")) return "m4a";
-                if (probed.contains("vorbis")) return "ogg";
-            } catch (Exception ignored) {}
+            }
+            if (header[0] == 'f' && header[1] == 'L' && header[2] == 'a' && header[3] == 'C') return "flac";
+            if (header[0] == 'O' && header[1] == 'g' && header[2] == 'g' && header[3] == 'S') return "ogg";
+            if (header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F') return "wav";
+            if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') return "m4a";
         } catch (Exception e) {
-            // ignore
+            // 读不到文件头就按最常见的 MP3 处理,后续标签写入失败会另行报告
         }
+        // ID3 标签或 MPEG 帧同步头都算 MP3
         return "mp3";
     }
 
@@ -393,89 +358,140 @@ public class Converter {
      * 检查 ffmpeg 是否可用
      */
     private static boolean isFfmpegAvailable() {
+        Process process = null;
         try {
             ProcessBuilder pb = new ProcessBuilder("ffmpeg", "-version");
             pb.redirectErrorStream(true);
-            Process p = pb.start();
-            return p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0;
+            process = pb.start();
+            // 先抽干输出再等结束,否则管道满了会互相卡住
+            drain(process.getInputStream(), null);
+            return process.waitFor(10, TimeUnit.SECONDS) && process.exitValue() == 0;
         } catch (Exception e) {
             return false;
+        } finally {
+            if (process != null) {
+                process.destroyForcibly();
+            }
         }
     }
 
     /**
-     * 使用 ffmpeg 将解密后的音频重新编码为标准 MP3 (320kbps CBR)
+     * 用 ffmpeg 把解密出的音频重编码为标准 MP3 (320kbps CBR)
+     *
+     * 音频从标准输入分块喂入:一是避开个别平台上非 ASCII 路径的解码问题,
+     * 二是整首音频不进堆,并发转换才不会耗尽内存;
+     * 对方输出必须由独立线程持续抽干,否则 ffmpeg 写满管道后会卡在写日志上,
+     * 我们又在等它读输入 —— 批量转换时的"卡死"就是这么来的
+     *
+     * @param source 解密出的原始音频
+     * @param target 目标 MP3
      */
-    private void reEncodeWithFfmpeg(String filePath) {
-        File original = new File(filePath);
-        File temp = new File(filePath + ".ffmpeg.mp3");
-        Process p = null;
+    private void reEncodeWithFfmpeg(File source, File target) throws IOException {
+        File parent = target.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+            throw new IOException("无法创建输出目录: " + parent);
+        }
+        ProcessBuilder pb = new ProcessBuilder(
+                "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y",
+                "-i", "pipe:0",
+                "-vn",
+                "-codec:a", "libmp3lame",
+                "-b:a", "320k",
+                "-map_metadata", "-1",
+                target.getAbsolutePath()
+        );
+        pb.redirectErrorStream(true);
+        Process process = null;
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                    "ffmpeg", "-y",
-                    "-i", "pipe:0",
-                    "-codec:a", "libmp3lame",
-                    "-b:a", "320k",
-                    "-map_metadata", "-1",
-                    temp.getAbsolutePath()
-            );
-            pb.redirectErrorStream(true);
-            p = pb.start();
-            // 分块写入标准输入:整首音频进堆会在并发转换时耗尽内存
-            try (FileInputStream fis = new FileInputStream(original);
-                 OutputStream os = p.getOutputStream()) {
+            process = pb.start();
+            final Process running = process;
+            final StringBuilder ffmpegLog = new StringBuilder();
+            Thread reader = new Thread(() -> drain(running.getInputStream(), ffmpegLog), "ffmpeg-log");
+            reader.setDaemon(true);
+            reader.start();
+
+            try (FileInputStream fis = new FileInputStream(source);
+                 OutputStream os = process.getOutputStream()) {
                 byte[] buffer = new byte[0x8000];
                 for (int len; (len = fis.read(buffer)) > 0; ) {
                     os.write(buffer, 0, len);
                 }
+                os.flush();
             }
-            // 静默读取避免阻塞，不打印错误
-            try (java.io.InputStream is = p.getInputStream()) {
-                is.transferTo(java.io.OutputStream.nullOutputStream());
+            if (!process.waitFor(FFMPEG_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+                throw new IOException("ffmpeg 超时(超过 " + FFMPEG_TIMEOUT_MINUTES + " 分钟)");
             }
-            int exitCode = p.waitFor();
-            if (exitCode == 0 && isValidAudio(temp)) {
-                if (original.delete()) {
-                    temp.renameTo(original);
-                } else {
-                    temp.delete();
-                }
-                System.out.format("ffmpeg 重编码完成：%s\n", filePath);
-            } else {
-                temp.delete();
-                System.out.format("ffmpeg 重编码失败（无法解析该文件），保留原始文件：%s\n", filePath);
+            reader.join(TimeUnit.SECONDS.toMillis(10));
+            if (process.exitValue() != 0) {
+                throw new IOException("ffmpeg 退出码 " + process.exitValue() + tailOf(ffmpegLog));
             }
-        } catch (Exception e) {
-            if (p != null) p.destroyForcibly();
-            temp.delete();
-            System.out.format("ffmpeg 重编码失败，保留原始文件：%s\n", filePath);
+            if (!target.isFile() || target.length() < 1024) {
+                throw new IOException("ffmpeg 输出不合法" + tailOf(ffmpegLog));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            deleteQuietly(target);
+            throw new IOException("转换被中断", e);
+        } catch (IOException | RuntimeException e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            deleteQuietly(target);
+            throw e;
         }
     }
 
-    /** 验证音频文件是否合法（有有效时长） */
-    private boolean isValidAudio(File file) {
-        if (!file.exists() || file.length() < 1024) return false;
-        try {
-            ProcessBuilder pb = new ProcessBuilder(
-                    "ffprobe", "-v", "quiet",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    file.getAbsolutePath()
-            );
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
-            String line;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                line = reader.readLine();
+    /**
+     * 抽干子进程输出,需要时保留末尾若干字符作为失败原因
+     */
+    private static void drain(InputStream stream, StringBuilder tail) {
+        byte[] buffer = new byte[0x2000];
+        try (InputStream in = stream) {
+            for (int read; (read = in.read(buffer)) > 0; ) {
+                if (tail == null) {
+                    continue;
+                }
+                tail.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+                if (tail.length() > 2000) {
+                    tail.delete(0, tail.length() - 2000);
+                }
             }
-            p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
-            if (line != null && !line.equals("N/A") && !line.isEmpty()) {
-                return Double.parseDouble(line) > 0.5;
-            }
-        } catch (Exception e) {
-            // ignore
+        } catch (IOException e) {
+            // 子进程已退出或被杀掉,读不到就算了
         }
-        return false;
+    }
+
+    private static String tailOf(StringBuilder log) {
+        String text = log.toString().trim();
+        return text.isEmpty() ? "" : ": " + text;
+    }
+
+    private static void copyFile(File source, File target) throws IOException {
+        File parent = target.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+            throw new IOException("无法创建输出目录: " + parent);
+        }
+        Files.copy(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /**
+     * 把临时文件搬到输出目录,跨盘时自动退化为复制+删除
+     */
+    private static void moveFile(File source, File target) throws IOException {
+        File parent = target.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+            throw new IOException("无法创建输出目录: " + parent);
+        }
+        Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private static void deleteQuietly(File file) {
+        if (file != null && file.isFile()) {
+            file.delete();
+        }
     }
 
 }

@@ -2,11 +2,22 @@
 网易云ncm音乐格式转换为mp3音乐格式工具
 
 ## 环境准备
-- JDK8.0
+- JDK 17（lombok 1.18.22 不兼容过高的 JDK）
 - 依赖构建工具 Maven
+- ffmpeg（仅在需要重编码为 MP3 时需要，放在 PATH 里）
 - 集成开发环境 IDEA(插件支持:Lombok)
 
 ## 运行说明
+
+两个工具都同时支持 macOS 与 Windows，代码里没有任何平台相关假设（路径一律用 `File.separator`，ffmpeg 从 PATH 探测）：
+
+| 平台 | NCM → MP3（主项目） | FLAC → MP3 + 元信息回写（flac-converter） |
+| :--: | :-- | :-- |
+| Windows | 双击或执行 `run.bat`（可加 `build` 强制重建，或传 `-c -f <path>`） | `run-flac.bat` |
+| macOS / Linux | `./run.sh`（或 `make run`） | `./run-flac.sh`（或 `make flac-run`） |
+| 直接跑 jar | `java -jar target/NCM2MP3-3.1.0.jar` | `java -jar flac-converter/target/flac-converter-1.0.0.jar` |
+
+依赖安装：macOS `make setup-mac`（brew 装 openjdk@17 / maven / ffmpeg），Windows `make setup-windows` 会列出对应的 winget 命令。
 
 ```text
 
@@ -18,8 +29,14 @@ If don't add command, there will open NCM2MP3 GUI directly
 [Command List]
 -v,-view                      : open NCM View GUI(default command)
 -c,--convert [path] ...       : convert NCM File in path to ./output directory
+-m,--mode <ncm|path>          : tag mode used with -c, default ncm
+-f,--ffmpeg                   : re-encode to MP3 320kbps CBR with ffmpeg
+-k,--keep-flac                : with -f, also keep the original FLAC in the output dir
 -h,-help                      : Help about any command
 ```
+
+不带 `-f` 时输出的是解密出的原始音频（扩展名按解密后的真实格式确定，NCM 里写的 format 只是参考）；带 `-f` 时输出目录里默认只有 MP3，
+中间解密的 FLAC 只存在于系统临时目录，转换失败不会留下半成品；需要无损原件时加 `-k`（界面里对应"高级设置 → 转 MP3 的同时保留原始 FLAC"）。
 
 转换时可以通过`-m/--mode`选择标签信息来源(默认为`ncm`,图形界面底部也可以直接选择模式):
 
@@ -32,6 +49,17 @@ If don't add command, there will open NCM2MP3 GUI directly
 示例: java -jar NCM2MP3.jar -c -m path /Users/johnny/Music/网易云音乐
 ```
 
+
+## flac-converter（同目录下的独立子项目）
+
+只做一件事：递归扫描一个目录里的 FLAC，转成 320kbps CBR 的 MP3，并把源文件自带的全部元信息（标题/歌手/专辑/专辑歌手/年份/流派/音轨/碟号/作曲/作词/备注/歌词 + 封面）写回 MP3。
+与主项目代码完全独立（`flac-converter/` 有自己的 pom 与 jar），界面为 选输入目录 → 扫描 → 选输出目录 → 开始转换 / 清空列表，输出保持源目录层级、同名 `.mp3`。
+
+几点实现约定：
+- 扫描按文件头 `fLaC` 判断格式，改名成 `.flac` 的其他格式会被跳过并在状态栏计数（这类文件在真实曲库里很常见）。
+- 音频通过标准输入分块喂给 ffmpeg，整首不进堆；ffmpeg 的输出由独立线程持续抽干，否则管道写满会双向死锁（批量转换"卡住"的根因）。
+- 封面固定写成"前封面"类型（部分便携播放器只认这一种），歌词来自音频内标签或同目录 `.lrc`（含网易云 `[ar:]`/署名行）。
+- 年份与流派若源文件本身没有，则不会凭空补（本地 NCM/FLAC/LRC 里确实都没有这两项）。
 
 ## 原理说明
   NCM格式是网易云音乐特有的音乐格式,这种音乐格式用到AES,RC4的加密算法对普通的音乐格式(如MP3,FLAC)进行加密,若要了解该加密过程,最好的方法就是知道起格式图,以及加密的原理(可以参考笔记`密码学.md`).
@@ -52,8 +80,8 @@ If don't add command, there will open NCM2MP3 GUI directly
 
 ## 项目构成说明
 - executor:控制管理
-  - ConvertTask.java 对应每一个音乐转换的任务(消费者)
-  - AsyncTaskExecutor.java 线程池,双空判断懒加载模式,核心线程10个，最大线程数20个，队列长度为100
+  - ConvertTask.java 对应每一个音乐转换的任务(消费者),状态回写一律切回事件分发线程
+  - AsyncTaskExecutor.java 线程池,固定线程数 `min(4, CPU核数/2)` + 无界队列,保证转换不会退回调用者线程(否则点"开始转换"会把界面卡死)
 - service:音乐格式转换核心功能实现
   - Converter.java 将NCM音乐解密拆分(==如果想快速看懂这个项目:建议从这个类开始看==), 将分析的各个数据整合到一起
   - Interpreter: 命令行参数解析器(策略模式分配命令处理)

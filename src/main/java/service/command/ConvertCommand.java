@@ -23,6 +23,7 @@ public class ConvertCommand extends BaseCommand {
     public void handle(List<String> params) {
         TagMode tagMode = TagMode.NCM;
         boolean reEncodeWithFfmpeg = false;
+        boolean keepFlacWithMp3 = false;
         ArrayList<String> paths = new ArrayList<>();
         for (int i = 0; i < params.size(); i++) {
             String param = params.get(i);
@@ -30,12 +31,15 @@ public class ConvertCommand extends BaseCommand {
                 tagMode = TagMode.from(params.get(++i));
             } else if ("-f".equals(param) || "--ffmpeg".equals(param)) {
                 reEncodeWithFfmpeg = true;
+            } else if ("-k".equals(param) || "--keep-flac".equals(param)) {
+                keepFlacWithMp3 = true;
             } else {
                 paths.add(param);
             }
         }
         System.out.printf("Tag mode is set to: %s%n", tagMode.name());
         System.out.printf("ffmpeg re-encode: %s%n", reEncodeWithFfmpeg);
+        System.out.printf("keep flac alongside mp3: %s%n", keepFlacWithMp3);
 
         //File outputPath = new File("." + File.separator + "output");
         File outputPath = new File("output");
@@ -57,7 +61,7 @@ public class ConvertCommand extends BaseCommand {
 
         //中途有修改过outputPath的对象引用，要copy一份final才能传入lambda
         File finalOutputPath = outputPath;
-        ConvertOptions options = new ConvertOptions(tagMode, reEncodeWithFfmpeg);
+        ConvertOptions options = new ConvertOptions(tagMode, reEncodeWithFfmpeg, keepFlacWithMp3);
         Converter converter = new Converter();
         List<Future<Boolean>> futures = files.stream()
                 .map(inputFile -> AsyncTaskExecutor.submit(() -> converter.ncm2Mp3(inputFile.getAbsolutePath(), finalOutputPath.getAbsolutePath(), options)))

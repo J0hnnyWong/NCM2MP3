@@ -20,6 +20,9 @@ public class HelpCommand extends BaseCommand {
         System.out.println("                                ncm : use tags embedded in NCM file");
         System.out.println("                                path: artist/album from <artist>/<album>/<song> dirs,");
         System.out.println("                                      cover from meta/track-{musicId} image");
+        System.out.println("-f,--ffmpeg                   : re-encode to MP3 320kbps CBR with ffmpeg (needs ffmpeg on PATH)");
+        System.out.println("-k,--keep-flac                : with -f, also keep the original FLAC in the output dir");
+        System.out.println("                                (default with -f: output dir gets MP3 only)");
         System.out.println("-h,-help                      : Help about any command");
         System.exit(0);
     }

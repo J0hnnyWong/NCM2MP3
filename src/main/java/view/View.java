@@ -14,6 +14,7 @@ import utils.Utils;
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableModel;
 import javax.swing.table.TableColumnModel;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
@@ -23,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.prefs.Preferences;
 
 /**
@@ -32,6 +34,10 @@ public class View extends JFrame {
     private static final Preferences PREFS = Preferences.userNodeForPackage(View.class);
     private static final String PREF_TAG_MODE = "tagMode";
     private static final String PREF_FFMPEG = "reEncodeWithFfmpeg";
+    private static final String PREF_KEEP_FLAC = "keepFlacWithMp3";
+
+    /** 一批转换进行中时禁用"开始转换",避免重复提交同一行 */
+    private volatile boolean converting;
 
     public View() {
         FlatIntelliJLaf.setup();
@@ -43,11 +49,13 @@ public class View extends JFrame {
         String savedTagMode = PREFS.get(PREF_TAG_MODE, TagMode.NCM.name());
         currentOptions.tagMode = TagMode.from(savedTagMode);
         currentOptions.reEncodeWithFfmpeg = PREFS.getBoolean(PREF_FFMPEG, false);
+        currentOptions.keepFlacWithMp3 = PREFS.getBoolean(PREF_KEEP_FLAC, false);
     }
 
     private void savePreferences() {
         PREFS.put(PREF_TAG_MODE, currentOptions.tagMode.name());
         PREFS.putBoolean(PREF_FFMPEG, currentOptions.reEncodeWithFfmpeg);
+        PREFS.putBoolean(PREF_KEEP_FLAC, currentOptions.keepFlacWithMp3);
     }
 
     private void button1MouseClicked(MouseEvent e) {
@@ -65,22 +73,45 @@ public class View extends JFrame {
     }
 
     private void button2MouseClicked(MouseEvent e) {
+        if (converting) {
+            return;
+        }
         int returnVal = jFileChooser2.showOpenDialog(panel);
-        List<Future<Boolean>> tasks = new ArrayList();
-        if (returnVal == JFileChooser.APPROVE_OPTION) {
-            File file = jFileChooser2.getSelectedFile();
-            String outFilePath = file.getAbsolutePath();
-            for (int i = 0; i < table.getModel().getRowCount(); i++) {
-                if (table.getModel().getValueAt(i, 3).equals("准备转换")) {
-                    String ncmFilePath = (String) table.getModel().getValueAt(i, 1);
-                    tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, currentOptions, table.getModel(), i)));
-                }
+        if (returnVal != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        String outFilePath = jFileChooser2.getSelectedFile().getAbsolutePath();
+        final TableModel model = table.getModel();
+        List<Integer> pending = new ArrayList<>();
+        for (int i = 0; i < model.getRowCount(); i++) {
+            if ("准备转换".equals(model.getValueAt(i, 3))) {
+                pending.add(i);
             }
         }
-        AsyncTaskExecutor.submit(() -> {
-            Utils.waitForAllTask(tasks, result -> result);
-            return null;
-        });
+        if (pending.isEmpty()) {
+            return;
+        }
+        converting = true;
+        button2.setEnabled(false);
+        final int total = pending.size();
+        final AtomicInteger done = new AtomicInteger();
+        List<Future<Boolean>> tasks = new ArrayList<>();
+        for (Integer row : pending) {
+            String ncmFilePath = (String) model.getValueAt(row, 1);
+            tasks.add(AsyncTaskExecutor.submit(new ConvertTask(ncmFilePath, outFilePath, currentOptions, model, row, () -> {
+                int finished = done.incrementAndGet();
+                setTitle("NCM2MP3 - 已完成 " + finished + "/" + total);
+                if (finished == total) {
+                    setTitle("NCM2MP3");
+                    converting = false;
+                    button2.setEnabled(true);
+                }
+            })));
+        }
+        // 汇总打印放到普通线程做:占住转换线程池的线程只会让整批更慢
+        Thread summary = new Thread(() -> Utils.waitForAllTask(tasks, result -> result), "convert-summary");
+        summary.setDaemon(true);
+        summary.start();
     }
 
     private void button3MouseClicked(MouseEvent e) {
@@ -123,6 +154,18 @@ public class View extends JFrame {
         ffmpegPanel.add(ffmpegCheckbox);
         settingsPanel.add(ffmpegPanel);
 
+        // --- 转 MP3 后是否额外保留 FLAC ---
+        JPanel keepFlacPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 5));
+        JCheckBox keepFlacCheckbox = new JCheckBox("转 MP3 的同时在输出目录保留原始 FLAC(否则输出目录只放 MP3)");
+        keepFlacCheckbox.setSelected(currentOptions.keepFlacWithMp3);
+        keepFlacCheckbox.setEnabled(ffmpegOk && currentOptions.reEncodeWithFfmpeg);
+        keepFlacPanel.add(Box.createHorizontalStrut(24));
+        keepFlacPanel.add(keepFlacCheckbox);
+        settingsPanel.add(keepFlacPanel);
+
+        ffmpegCheckbox.addActionListener(ev ->
+                keepFlacCheckbox.setEnabled(ffmpegOk && ffmpegCheckbox.isSelected()));
+
         dialog.add(settingsPanel, BorderLayout.CENTER);
 
         // --- 按钮 ---
@@ -137,6 +180,7 @@ public class View extends JFrame {
             currentOptions.tagMode = (TagMode) tagComboBox.getSelectedItem();
             if (ffmpegOk) {
                 currentOptions.reEncodeWithFfmpeg = ffmpegCheckbox.isSelected();
+                currentOptions.keepFlacWithMp3 = ffmpegCheckbox.isSelected() && keepFlacCheckbox.isSelected();
             }
             savePreferences();
             dialog.dispose();
@@ -152,9 +196,16 @@ public class View extends JFrame {
     private boolean isFfmpegInstalled() {
         try {
             ProcessBuilder pb = new ProcessBuilder("ffmpeg", "-version");
-            pb.redirectErrorStream(true);
+            // 丢弃输出而不是接管道:没人读的管道填满会让子进程卡住,这里是界面线程,卡不得
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process p = pb.start();
-            return p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0;
+            boolean finished = p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                return false;
+            }
+            return p.exitValue() == 0;
         } catch (Exception e) {
             return false;
         }
