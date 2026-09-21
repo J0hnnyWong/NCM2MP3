@@ -4,11 +4,14 @@ import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.ButtonGroup;
 import javax.swing.JComponent;
 import javax.swing.JFileChooser;
+import javax.swing.JDialog;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JRadioButton;
 import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTable;
@@ -43,6 +46,7 @@ public class FlacConverterFrame extends JFrame {
     private static final Preferences PREFS = Preferences.userNodeForPackage(FlacConverterFrame.class);
     private static final String PREF_INPUT = "inputDir";
     private static final String PREF_OUTPUT = "outputDir";
+    private static final String PREF_LAYOUT = "outputLayout";
 
     private static final String STATUS_WAITING = "待转换";
     private static final String STATUS_RUNNING = "转换中";
@@ -50,7 +54,7 @@ public class FlacConverterFrame extends JFrame {
     /**
      * 与表格模型行一一对应,只在事件分发线程上增删
      */
-    private final List<Item> items = new ArrayList<>();
+    private final List<SourceItem> items = new ArrayList<>();
 
     private final Set<String> listedPaths = ConcurrentHashMap.newKeySet();
 
@@ -60,14 +64,21 @@ public class FlacConverterFrame extends JFrame {
 
     private JTextField inputField;
     private JTextField outputField;
+    private JLabel layoutLabel;
     private DefaultTableModel tableModel;
     private JTable table;
     private JButton scanButton;
     private JButton convertButton;
     private JButton clearButton;
+    private JButton settingsButton;
     private JProgressBar progressBar;
     private JLabel infoLabel;
     private volatile boolean ffmpegAvailable;
+
+    /**
+     * 输出摆放方式,默认平铺
+     */
+    private volatile OutputLayout outputLayout = OutputLayout.from(PREFS.get(PREF_LAYOUT, null), OutputLayout.FLAT);
 
     public FlacConverterFrame() {
         super("FLAC 元信息转换");
@@ -75,6 +86,7 @@ public class FlacConverterFrame extends JFrame {
         initComponents();
         inputField.setText(PREFS.get(PREF_INPUT, ""));
         outputField.setText(PREFS.get(PREF_OUTPUT, ""));
+        refreshLayoutLabel();
         checkFfmpeg();
         setLocationRelativeTo(null);
     }
@@ -116,7 +128,8 @@ public class FlacConverterFrame extends JFrame {
         pickOutput.addActionListener(e -> chooseDirectory(outputField, "请选择转换结果保存目录"));
         outputRow.add(pickOutput);
         outputRow.add(Box.createHorizontalStrut(8));
-        outputRow.add(new JLabel("保持原目录层级,输出同名 .mp3"));
+        layoutLabel = new JLabel();
+        outputRow.add(layoutLabel);
         panel.add(outputRow);
         return panel;
     }
@@ -158,6 +171,9 @@ public class FlacConverterFrame extends JFrame {
         clearButton = new JButton("清空列表");
         clearButton.addActionListener(e -> clearList());
         buttons.add(clearButton);
+        settingsButton = new JButton("高级设置");
+        settingsButton.addActionListener(e -> showAdvancedSettings());
+        buttons.add(settingsButton);
         panel.add(buttons, BorderLayout.WEST);
 
         progressBar = new JProgressBar(0, 0);
@@ -196,7 +212,7 @@ public class FlacConverterFrame extends JFrame {
                     continue;
                 }
                 listedPaths.add(path);
-                Item item = new Item(file, relativePath(root, file));
+                SourceItem item = new SourceItem(file, relativePath(root, file));
                 Metadata data = SourceReader.summary(file);
                 appendRow(item, data);
                 added++;
@@ -253,19 +269,26 @@ public class FlacConverterFrame extends JFrame {
         }
         setBusy(true);
         File outputRoot = new File(output);
+        // 一次性规划全部落点:平铺时要知道谁和谁撞名才能加区分后缀
+        List<SourceItem> pendingItems = new ArrayList<>(pending.size());
+        for (int row : pending) {
+            pendingItems.add(items.get(row));
+        }
+        final List<File> targets = OutputPlanner.plan(pendingItems, outputRoot, outputLayout);
         progressBar.setMaximum(pending.size());
         progressBar.setValue(0);
         AtomicInteger done = new AtomicInteger();
         AtomicInteger failed = new AtomicInteger();
-        for (int row : pending) {
+        for (int i = 0; i < pending.size(); i++) {
+            final int row = pending.get(i);
+            final File target = targets.get(i);
+            final SourceItem item = pendingItems.get(i);
             tableModel.setValueAt(STATUS_RUNNING, row, 4);
-            Item item = items.get(row);
-            File target = item.targetIn(outputRoot);
             convertExecutor.submit(() -> {
                 String status;
                 boolean isError = false;
                 try {
-                    status = Converter.convert(item.source, target).statusText();
+                    status = Converter.convert(item.source(), target).statusText();
                 } catch (Exception e) {
                     status = "失败: " + reasonOf(e);
                     isError = true;
@@ -296,11 +319,11 @@ public class FlacConverterFrame extends JFrame {
         infoLabel.setText("列表已清空");
     }
 
-    private void appendRow(Item item, Metadata data) {
+    private void appendRow(SourceItem item, Metadata data) {
         SwingUtilities.invokeLater(() -> {
             items.add(item);
             tableModel.addRow(new Object[]{
-                    item.display,
+                    item.display(),
                     data.artistText(),
                     data.album,
                     data.title,
@@ -340,6 +363,8 @@ public class FlacConverterFrame extends JFrame {
         scanButton.setEnabled(!busy);
         convertButton.setEnabled(!busy && ffmpegAvailable);
         clearButton.setEnabled(!busy);
+        // 转换中途改摆放方式会让已排队的任务和界面提示对不上,直接锁掉
+        settingsButton.setEnabled(!busy);
         progressBar.setIndeterminate(busy && progressBar.getMaximum() == 0);
     }
 
@@ -366,32 +391,68 @@ public class FlacConverterFrame extends JFrame {
         return Math.max(1, Math.min(4, cores / 2));
     }
 
+    private void refreshLayoutLabel() {
+        OutputLayout layout = outputLayout;
+        layoutLabel.setText(layout == OutputLayout.FLAT
+                ? "输出方式: 平铺(都放输出目录顶层,同名歌自动加专辑名区分)"
+                : "输出方式: 保持原目录层级,输出同名 .mp3");
+    }
+
     /**
-     * 列表一行的来源信息:绝对路径 + 相对扫描根目录的展示路径
+     * 高级设置:目前只有输出摆放方式,选完立即生效并持久化,下次"开始转换"按新设置落盘
      */
-    private static class Item {
+    private void showAdvancedSettings() {
+        JDialog dialog = new JDialog(this, "高级设置", true);
+        dialog.setLayout(new BorderLayout(10, 10));
 
-        private final File source;
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBorder(BorderFactory.createEmptyBorder(15, 20, 10, 20));
 
-        private final String display;
-
-        Item(File source, String display) {
-            this.source = source;
-            this.display = display;
+        panel.add(row(new JLabel("输出文件的摆放方式:")));
+        ButtonGroup group = new ButtonGroup();
+        JRadioButton flatOption = new JRadioButton(OutputLayout.FLAT.label());
+        JRadioButton treeOption = new JRadioButton(OutputLayout.KEEP_TREE.label());
+        for (JRadioButton option : new JRadioButton[]{flatOption, treeOption}) {
+            JPanel optionRow = row(option);
+            optionRow.setBorder(BorderFactory.createEmptyBorder(0, 24, 0, 0));
+            panel.add(optionRow);
         }
+        group.add(flatOption);
+        group.add(treeOption);
+        (outputLayout == OutputLayout.FLAT ? flatOption : treeOption).setSelected(true);
 
-        /**
-         * 输出目录里保持与源目录相同的层级,扩展名换成 .mp3
-         */
-        File targetIn(File outputRoot) {
-            String name = display;
-            int dot = name.lastIndexOf('.');
-            if (dot > 0) {
-                name = name.substring(0, dot) + ".mp3";
-            } else {
-                name = name + ".mp3";
-            }
-            return outputRoot.toPath().resolve(name).toFile();
-        }
+        JPanel hint = row(new JLabel("<html><font color='gray'>平铺适合直接丢进播放器;层级模式会按扫描目录重建文件夹。"
+                + "<br>只影响输出位置,标签与封面两种模式完全一样。</font></html>"));
+        hint.setBorder(BorderFactory.createEmptyBorder(10, 24, 0, 0));
+        panel.add(hint);
+
+        dialog.add(panel, BorderLayout.CENTER);
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 10));
+        JButton okButton = new JButton("确定");
+        JButton cancelButton = new JButton("取消");
+        buttons.add(okButton);
+        buttons.add(cancelButton);
+        dialog.add(buttons, BorderLayout.SOUTH);
+
+        okButton.addActionListener(e -> {
+            outputLayout = flatOption.isSelected() ? OutputLayout.FLAT : OutputLayout.KEEP_TREE;
+            PREFS.put(PREF_LAYOUT, outputLayout.name());
+            refreshLayoutLabel();
+            dialog.dispose();
+        });
+        cancelButton.addActionListener(e -> dialog.dispose());
+
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setResizable(false);
+        dialog.setVisible(true);
+    }
+
+    private static JPanel row(JComponent component) {
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 5));
+        panel.add(component);
+        return panel;
     }
 }
